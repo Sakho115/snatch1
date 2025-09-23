@@ -37,7 +37,7 @@ with contextlib.suppress(Exception):
     import yt_dlp  # type: ignore
 
 # -------------------- Config --------------------
-MAX_SIZE_MB = int(os.getenv("MAX_SIZE_MB", "512"))
+MAX_SIZE_MB = int(os.getenv("MAX_SIZE_MB", "2048"))
 MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
 TTL_SECONDS = int(os.getenv("TTL_SECONDS", "3600"))
 ALLOW_YTDLP = os.getenv("ALLOW_YTDLP", "1") not in ("0", "false", "False")
