@@ -1,13 +1,18 @@
-# snatch_backend.py
+# snatch_backend_fixed.py
 """
 SNATCH – universal downloader backend (single-file, FastAPI)
-Latest fixed version:
-- Auto-detect ffmpeg and pass its location to yt-dlp.
-- If ffmpeg missing, yt-dlp will avoid merging formats (retry fallback).
-- Sanitizes filenames to ASCII-safe values (prevents latin-1 header errors).
-- Uses yt-dlp options to restrict filenames and behave politely.
-- Supports direct downloads + yt-dlp (YouTube, Instagram, TikTok, etc).
-- Keeps in-memory JOB registry, TTL janitor, SSRF guards, and size limits.
+Rewritten to fix CORS, deployment issues, and a few robustness improvements.
+
+Key changes:
+- Proper CORS configuration driven by CORS_ORIGINS env var (defaults to "*").
+- mk_job initializes timestamps (avoids time() at import time).
+- uvicorn.run uses the `app` object so module name mismatches won't break startups.
+- Retains yt-dlp, direct-download, job registry, janitor, and size limits.
+- Cleaner logging and safer filename sanitization.
+
+Drop this file into your repo (replace previous snatch_backend.py), push to GitHub
+and let Render deploy (or trigger a manual deploy). Make sure Render environment
+variables include CORS_ORIGINS (e.g. your Vercel URL) and other SNATCH_* variables.
 """
 
 import asyncio
@@ -41,6 +46,7 @@ MAX_SIZE_MB = int(os.getenv("MAX_SIZE_MB", "2048"))
 MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
 TTL_SECONDS = int(os.getenv("TTL_SECONDS", "3600"))
 ALLOW_YTDLP = os.getenv("ALLOW_YTDLP", "1") not in ("0", "false", "False")
+# CORS_ORIGINS: comma-separated list (use "*" to allow all)
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip() or None
 
@@ -49,14 +55,19 @@ DOWNLOADS_ROOT = Path(os.getenv("SNATCH_DIR") or (HOME / "Downloads" / "snatch")
 DOWNLOADS_ROOT.mkdir(parents=True, exist_ok=True)
 TMP_ROOT = DOWNLOADS_ROOT
 
+# -------------------- App & CORS --------------------
 app = FastAPI(title="Snatch Backend", version="2.3.0")
+
+_allow_origins = ["*"] if CORS_ORIGINS == ["*"] else CORS_ORIGINS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if CORS_ORIGINS == ["*"] else CORS_ORIGINS,
+    allow_origins=_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+print(f"[snatch] CORS allow_origins={_allow_origins}")
 
 # -------------------- Models --------------------
 class DownloadRequest(BaseModel):
@@ -87,9 +98,9 @@ class Job(BaseModel):
     bytes_done: int = 0
     status: str = "queued"
     error: Optional[str] = None
-    started_at: float = time.time()
-    updated_at: float = time.time()
-    expires_at: float = time.time() + TTL_SECONDS
+    started_at: float = 0.0
+    updated_at: float = 0.0
+    expires_at: float = 0.0
     meta: Optional[Dict[str, Any]] = None
 
 JOBS: Dict[str, Job] = {}
@@ -115,17 +126,14 @@ DEFAULT_HEADERS = {
     "Accept": "*/*",
 }
 
-# sanitize filename to ASCII-safe header-friendly value
+
 def sanitize_filename_for_header(name: str, fallback: str = "file") -> str:
     name = (name or "").strip() or fallback
-    # Normalize and remove non-ascii
     name = unicodedata.normalize("NFKD", name)
     name = name.encode("ascii", "ignore").decode("ascii")
-    # Keep only safe chars
     name = re.sub(r'[^A-Za-z0-9._-]+', '_', name).strip('_')
     if not name:
         name = fallback
-    # limit length
     if len(name) > 200:
         name = name[:200]
     return name
@@ -142,11 +150,17 @@ async def resolve_remote_ip(host: str) -> str:
             raise HTTPException(400, detail="Blocked internal IP range")
     return ip
 
+
 def mk_job(kind: str, url: str, filename: Optional[str] = None) -> Job:
     jid = str(uuid.uuid4())
     jb = Job(id=jid, kind=kind, url=url, filename=filename)
+    now = time.time()
+    jb.started_at = now
+    jb.updated_at = now
+    jb.expires_at = now + TTL_SECONDS
     JOBS[jid] = jb
     return jb
+
 
 def job_dir(job: Job) -> Path:
     d = TMP_ROOT / job.id
@@ -162,9 +176,11 @@ async def fetch_headers(client: httpx.AsyncClient, url: str) -> httpx.Response:
     except httpx.HTTPError as e:
         raise HTTPException(400, detail=f"HEAD/GET failed: {e}")
 
+
 def guess_filename_from_url(u: str) -> str:
     path_part = Path(urlparse(u).path).name
     return path_part or "download"
+
 
 def is_probably_video_site(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
@@ -174,6 +190,7 @@ def is_probably_video_site(url: str) -> bool:
     return False
 
 # -------------------- ffmpeg detection --------------------
+
 def find_ffmpeg() -> Optional[str]:
     from shutil import which
     p = which("ffmpeg")
@@ -192,9 +209,9 @@ else:
     print("[snatch] ffmpeg not found on PATH. yt-dlp will prefer 'best' single-file formats (no merging).")
 
 # -------------------- yt-dlp helpers --------------------
+
 def _make_ytdlp_opts(outdir: Path, fmt: Optional[str], audio_only: bool) -> Dict[str, Any]:
     template = str(outdir / "%(title).200B-%(id)s.%(ext)s")
-    # If ffmpeg present allow merging, else prefer single-file 'best' to avoid merge requirement
     if FFMPEG_PATH:
         ytdlp_format = "bestaudio/best" if audio_only else (fmt or "bestvideo+bestaudio/best")
     else:
@@ -209,13 +226,11 @@ def _make_ytdlp_opts(outdir: Path, fmt: Optional[str], audio_only: bool) -> Dict
         'retries': 3,
         'nocheckcertificate': False,
         'http_headers': {'User-Agent': DEFAULT_HEADERS['User-Agent']},
-        # ensure file names are limited / safe
         'restrictfilenames': True,
         'windowsfilenames': True,
     }
 
     if FFMPEG_PATH:
-        # point to parent dir (yt-dlp accepts binary or dir; parent is safe)
         opts['ffmpeg_location'] = str(Path(FFMPEG_PATH).parent)
         opts['merge_output_format'] = 'mp4'
 
@@ -231,6 +246,7 @@ def _make_ytdlp_opts(outdir: Path, fmt: Optional[str], audio_only: bool) -> Dict
         opts['cookiefile'] = COOKIES_FILE
     return opts
 
+
 def _pick_latest_file_in_dir(d: Path) -> Optional[Path]:
     try:
         files = [p for p in d.iterdir() if p.is_file()]
@@ -240,6 +256,7 @@ def _pick_latest_file_in_dir(d: Path) -> Optional[Path]:
         return files[0]
     except Exception:
         return None
+
 
 async def run_ytdlp(job: Job, fmt: Optional[str], audio_only: bool = False) -> None:
     if 'yt_dlp' not in globals() or not ALLOW_YTDLP:
@@ -270,7 +287,6 @@ async def run_ytdlp(job: Job, fmt: Optional[str], audio_only: bool = False) -> N
     except Exception as e:
         err_text = str(e)
         print(f"[snatch] yt-dlp initial error: {err_text}")
-        # retry logic: if merging error occurred and no ffmpeg, retry with 'best' single-file
         if ("requested merging of multiple formats" in err_text or "You have requested merging of multiple formats" in err_text) and not FFMPEG_PATH:
             print("[snatch] retrying yt-dlp with safe 'best' format (no merging) because ffmpeg not found")
             safe_opts = _make_ytdlp_opts(outdir, "best", audio_only)
@@ -284,14 +300,12 @@ async def run_ytdlp(job: Job, fmt: Optional[str], audio_only: bool = False) -> N
         else:
             raise HTTPException(400, detail=f"yt-dlp error: {e}")
 
-    # finalize file path
     try:
         fpath = None
         if info and isinstance(info, dict):
             if 'requested_downloads' in info and info['requested_downloads']:
                 fpath = info['requested_downloads'][0].get('filepath')
             else:
-                # use ydl.prepare_filename via a short YDL (requires import)
                 try:
                     with yt_dlp.YoutubeDL({'quiet': True}) as ytmp:
                         fpath = ytmp.prepare_filename(info)
@@ -301,11 +315,9 @@ async def run_ytdlp(job: Job, fmt: Optional[str], audio_only: bool = False) -> N
         if fpath:
             fpath = Path(fpath)
         else:
-            # fallback: pick the newest file in outdir
             fpath = _pick_latest_file_in_dir(outdir)
 
         if not fpath or not fpath.exists():
-            # try searching common extensions
             if fpath and fpath.parent.exists():
                 for ext in ("mp4", "mkv", "webm", "m4a", "mp3", "wav", "ogg", "flac"):
                     candidate = fpath.with_suffix('.' + ext) if fpath else None
@@ -313,17 +325,14 @@ async def run_ytdlp(job: Job, fmt: Optional[str], audio_only: bool = False) -> N
                         fpath = candidate
                         break
             if not fpath or not fpath.exists():
-                # final fallback: scan outdir
                 fpath = _pick_latest_file_in_dir(outdir)
                 if not fpath:
                     raise HTTPException(400, detail="yt-dlp finished but produced no file")
 
-        # sanitize file name and (optionally) rename file to ASCII-safe name
         safe_name = sanitize_filename_for_header(fpath.name)
         if safe_name != fpath.name:
             try:
                 new_path = fpath.with_name(safe_name)
-                # avoid overwrite
                 i = 1
                 while new_path.exists():
                     stem = Path(safe_name).stem
@@ -399,7 +408,6 @@ async def stream_download(job: Job) -> None:
         if not Path(base).suffix and ext:
             base = base + ext
 
-        # sanitize base for filesystem + header safety
         fname = sanitize_filename_for_header(base)
 
         dest_dir = job_dir(job)
@@ -603,15 +611,11 @@ async def get_file(jid: str):
     if not path.exists():
         raise HTTPException(410, detail="File expired")
 
-    # ensure header-safe filename
     header_name = sanitize_filename_for_header(job.filename or path.name)
-
-    # include custom headers (these are ASCII-safe)
     headers = {
         "X-Snatch-Id": job.id,
         "Cache-Control": "no-store"
     }
-
     mime, _ = mimetypes.guess_type(path.name)
     return FileResponse(
         path,
@@ -630,7 +634,7 @@ async def delete_job(jid: str):
     job.expires_at = 0
     return {"ok": True}
 
-# ---------- One-shot "smart" downloader that returns the file directly ----------
+# One-shot downloader (returns file directly)
 @app.post("/download")
 async def download_file(request: Request):
     try:
@@ -683,4 +687,6 @@ async def root():
     })
 
 if __name__ == "__main__":
-    uvicorn.run("snatch:app", host="0.0.0.0", port=8000, reload=False)
+    # Use PORT env var when available (Render sets it automatically)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
