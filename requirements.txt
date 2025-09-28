@@ -22,3 +22,6 @@ uvloop==0.21.0
 watchfiles==1.1.0
 websockets==15.0.1
 yt-dlp==2025.9.5
+
+Add this line if you need to manually manage the temporary cookie file:
+tempfile
