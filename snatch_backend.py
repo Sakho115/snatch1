@@ -1,18 +1,14 @@
-# snatch_backend_fixed.py
 """
 SNATCH – universal downloader backend (single-file, FastAPI)
-Rewritten to fix CORS, deployment issues, and a few robustness improvements.
+Rewritten to fix the "Sign in to confirm you're not a bot" error in cloud hosting (Render).
 
 Key changes:
-- Proper CORS configuration driven by CORS_ORIGINS env var (defaults to "*").
-- mk_job initializes timestamps (avoids time() at import time).
-- uvicorn.run uses the `app` object so module name mismatches won't break startups.
+- Cloud Cookie Fix: The script now reads the ENTIRE cookie file content from the
+  YOUTUBE_COOKIES_STRING environment variable on startup and writes it to a
+  temporary file (/tmp/yt_cookies.txt), which yt-dlp then uses for authentication.
+- Proper CORS configuration driven by CORS_ORIGINS env var.
 - Retains yt-dlp, direct-download, job registry, janitor, and size limits.
 - Cleaner logging and safer filename sanitization.
-
-Drop this file into your repo (replace previous snatch_backend.py), push to GitHub
-and let Render deploy (or trigger a manual deploy). Make sure Render environment
-variables include CORS_ORIGINS (e.g. your Vercel URL) and other SNATCH_* variables.
 """
 
 import asyncio
@@ -23,6 +19,7 @@ import os
 import re
 import shutil
 import socket
+import tempfile # Added for cloud temp file generation
 import time
 import unicodedata
 import uuid
@@ -41,14 +38,47 @@ import uvicorn
 with contextlib.suppress(Exception):
     import yt_dlp  # type: ignore
 
-# -------------------- Config --------------------
+# -------------------- Config & Cookie Setup --------------------
 MAX_SIZE_MB = int(os.getenv("MAX_SIZE_MB", "2048"))
 MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
 TTL_SECONDS = int(os.getenv("TTL_SECONDS", "3600"))
 ALLOW_YTDLP = os.getenv("ALLOW_YTDLP", "1") not in ("0", "false", "False")
-# CORS_ORIGINS: comma-separated list (use "*" to allow all)
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
-COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip() or None
+
+# Global variable for cookies file path, set dynamically at runtime
+COOKIES_FILE: Optional[str] = None
+COOKIES_FILE_NAME = "yt_cookies.txt"
+
+def init_cookies():
+    """Reads cookie data from YOUTUBE_COOKIES_STRING env var and writes it to a temp file."""
+    global COOKIES_FILE
+    
+    # 1. Prioritize reading raw cookie content from Environment Variable
+    cookie_string = os.getenv("YOUTUBE_COOKIES_STRING", "").strip()
+    
+    if cookie_string:
+        # Write the cookie string to a temporary file in the /tmp directory
+        temp_dir = Path(tempfile.gettempdir())
+        temp_cookie_path = temp_dir / COOKIES_FILE_NAME
+        try:
+            temp_cookie_path.write_text(cookie_string, encoding='utf-8')
+            COOKIES_FILE = str(temp_cookie_path)
+            print(f"[snatch] SUCCESS: Cookies loaded from YOUTUBE_COOKIES_STRING into {COOKIES_FILE}")
+        except Exception as e:
+            print(f"[snatch] WARNING: Failed to write temp cookies file: {e}")
+            COOKIES_FILE = None
+    else:
+        # Fallback to local configuration, e.g., for local development
+        local_env_path = os.getenv("COOKIES_FILE", "").strip()
+        if local_env_path and Path(local_env_path).exists():
+            COOKIES_FILE = local_env_path
+            print(f"[snatch] SUCCESS: Cookies file found locally at: {COOKIES_FILE}")
+        else:
+             print(f"[snatch] WARNING: No YOUTUBE_COOKIES_STRING set and no local path found.")
+
+init_cookies()
+# -------------------- End Config & Cookie Setup --------------------
+
 
 HOME = Path.home()
 DOWNLOADS_ROOT = Path(os.getenv("SNATCH_DIR") or (HOME / "Downloads" / "snatch"))
@@ -242,8 +272,11 @@ def _make_ytdlp_opts(outdir: Path, fmt: Optional[str], audio_only: bool) -> Dict
             'preferredcodec': codec,
             'preferredquality': '0',
         }]
-    if COOKIES_FILE and Path(COOKIES_FILE).exists():
+    
+    # Use the globally set path to the temporary cookies file (from init_cookies)
+    if COOKIES_FILE:
         opts['cookiefile'] = COOKIES_FILE
+        
     return opts
 
 
@@ -287,6 +320,13 @@ async def run_ytdlp(job: Job, fmt: Optional[str], audio_only: bool = False) -> N
     except Exception as e:
         err_text = str(e)
         print(f"[snatch] yt-dlp initial error: {err_text}")
+        
+        youtube_auth_err = "Sign in to confirm you’re not a bot" in err_text
+        if youtube_auth_err:
+             # Provide an actionable error message when the cause is missing cookies
+            auth_message = f"yt-dlp error: YouTube authentication required (bot-check). Please ensure the **YOUTUBE_COOKIES_STRING** environment variable is set with valid Netscape cookie data."
+            raise HTTPException(400, detail=auth_message)
+            
         if ("requested merging of multiple formats" in err_text or "You have requested merging of multiple formats" in err_text) and not FFMPEG_PATH:
             print("[snatch] retrying yt-dlp with safe 'best' format (no merging) because ffmpeg not found")
             safe_opts = _make_ytdlp_opts(outdir, "best", audio_only)
@@ -659,6 +699,10 @@ async def download_file(request: Request):
         raise he
     except Exception as e:
         print(f"[snatch] download_file error: {e}")
+        # Checks for the error text and points to the hardcoded file if cookies were not found
+        if "Sign in to confirm you’re not a bot" in str(e):
+             auth_message = f"yt-dlp error: YouTube authentication required (bot-check). Please ensure the **YOUTUBE_COOKIES_STRING** environment variable is set with valid Netscape cookie data."
+             raise HTTPException(400, detail=auth_message)
         raise HTTPException(500, detail=f"Download failed: {e}")
 
     path = Path(job.filepath or "")
@@ -681,7 +725,7 @@ async def root():
         "max_size_mb": MAX_SIZE_MB,
         "ttl_seconds": TTL_SECONDS,
         "allow_ytdlp": ALLOW_YTDLP,
-        "cookies_file": bool(COOKIES_FILE),
+        "cookies_file_used": COOKIES_FILE,
         "download_root": str(TMP_ROOT),
         "ffmpeg": FFMPEG_PATH,
     })
@@ -689,4 +733,6 @@ async def root():
 if __name__ == "__main__":
     # Use PORT env var when available (Render sets it automatically)
     port = int(os.getenv("PORT", 8000))
+    # Note: uvicorn.run(app, ...) is safer than running it via a string reference
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
